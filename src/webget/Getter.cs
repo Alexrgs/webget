@@ -1,10 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace webget
 {
@@ -24,6 +27,9 @@ namespace webget
         public int RecursionDepth { get; set; }
         public int RequestTimeout { get; set; }
         public bool LinkLabel { get; set; }
+        private int CursorLeft { get; set; }
+        private int CursorTop { get; set; }
+        private static readonly object lockconsole = new object();
 
         public void Execute()
         {
@@ -31,14 +37,56 @@ namespace webget
                 Directory.CreateDirectory(SaveDirectory);
 
             using (var client = new NetClient
-                {
-                    ProxyData = ProxyData,
-                    Encoding = Encoding.UTF8,
-                    UserAgent = UserAgent,
-                    RequestTimeout = RequestTimeout
-                })
             {
+                ProxyData = ProxyData,
+                Encoding = Encoding.UTF8,
+                UserAgent = UserAgent,
+                RequestTimeout = RequestTimeout
+
+            })
+            {
+
                 ExecuteInternal(client, Uri, Extensions, SaveDirectory, RecursionDepth);
+            }
+        }
+
+        public AsyncCompletedEventHandler DownloadFileCompleted(int cursorLeft, int cursorTop)
+        {
+            Action<object, AsyncCompletedEventArgs> action = (sender, e) =>
+            {
+                WriteSameLineToconsole(cursorLeft, cursorTop, "Completed");
+            };
+            return new AsyncCompletedEventHandler(action);
+        }
+
+        private DownloadProgressChangedEventHandler UpdateDownloadStatus(int cursorLeft, int cursorTop,string filename)
+        {
+            Action<object, DownloadProgressChangedEventArgs> action = (sender, args) =>
+            {
+
+                var text = $"{filename} {Environment.NewLine} Progress.. {args.ProgressPercentage} % Received: {args.BytesReceived / 1024} Kb from  {args.TotalBytesToReceive / 1024} Kb "  ;
+
+                WriteSameLineToconsole(cursorLeft, cursorTop, text);
+            };
+            return new DownloadProgressChangedEventHandler(action);
+
+        }
+
+        private static void WriteSameLineToconsole(int cursorLeft, int cursorTop, string text)
+        {
+            lock (lockconsole)
+            {
+                Console.SetCursorPosition(cursorLeft, cursorTop);
+
+                Console.Write(text);
+            }
+        }
+
+        private static void WriteNewLineToconsole(string text)
+        {
+            lock (lockconsole)
+            {
+                Console.WriteLine(text);
             }
         }
 
@@ -52,12 +100,12 @@ namespace webget
                 var resources = ContentParser.ExtractUris(content)
                                              .Where(x => x.Value.EndsWithAny(extensions))
                                              .Select(x => new UriData
-                                                 {
-                                                     Value = x.Value.ToAbsoluteUri(uri),
-                                                     Label = x.Label.Normailze(100)
-                                                 })
+                                             {
+                                                 Value = x.Value.ToAbsoluteUri(uri),
+                                                 Label = x.Label.Normailze(100)
+                                             })
                                              .Distinct(x => x.Value);
-                DownloadFiles(client, resources, directory, currentDepth);
+                DownloadFiles(client, resources, directory, currentDepth).GetAwaiter().GetResult();
 
                 if (maxDepth < 0 || currentDepth < maxDepth)
                 {
@@ -70,7 +118,7 @@ namespace webget
 
                     currentDepth++;
                     foreach (var s in sites)
-                    {                        
+                    {
                         ExecuteInternal(client, s, extensions, directory, maxDepth, currentDepth);
                     }
                 }
@@ -91,11 +139,20 @@ namespace webget
             }
         }
 
-        private void DownloadFiles(NetClient client, IEnumerable<UriData> uris, string directory, int currentDepth)
+        private async Task DownloadFiles(NetClient client, IEnumerable<UriData> uris, string directory, int currentDepth)
         {
             var i = -1;
+            var maxConcurrency = 5;
+
+            var allTasks = new List<Task>();
+            var throttler = new SemaphoreSlim(initialCount: 5);
+
             foreach (var uri in uris)
             {
+
+                // do an async wait until we can schedule again
+                await throttler.WaitAsync();
+
                 var name = LinkLabel && !string.IsNullOrEmpty(uri.Label)
                                ? string.Format("{0}.{1}", uri.Label, uri.Value.Split('.').Last())
                                : uri.Value.Split('/').Last();
@@ -111,6 +168,8 @@ namespace webget
                     continue;
                 }
 
+
+
                 try
                 {
                     if (GreaterThan > 0 || LessThan > 0)
@@ -125,14 +184,47 @@ namespace webget
                                 continue;
                         }
                     }
-                    Console.WriteLine(@"[{0}.{1}]: downloading ""{2}""...", currentDepth, ++i, name);
-                    client.DownloadFile(uri.Value, path);
+                   
+                    // using Task.Run(...) to run the lambda in its own parallel
+                    // flow on the threadpool
+                    allTasks.Add(
+                        Task.Run(async () =>
+                        {
+                            try
+                            {
+
+                                var localClient = new NetClient()
+                                {
+                                    ProxyData = ProxyData,
+                                    Encoding = Encoding.UTF8,
+                                    UserAgent = UserAgent,
+                                    RequestTimeout = RequestTimeout
+                                };
+
+                                var file = string.Format(@"[{0}.{1}]: downloading ""{2}""...", currentDepth, ++i, name);
+                                WriteNewLineToconsole("");
+
+                                localClient.DownloadFileCompleted += DownloadFileCompleted(Console.CursorLeft, Console.CursorTop);
+                                localClient.DownloadProgressChanged += UpdateDownloadStatus(Console.CursorLeft, Console.CursorTop, file);
+
+                                WriteNewLineToconsole("");
+                                await localClient.DownloadFileTaskAsync(uri.Value, path);
+                            }
+                            finally
+                            {
+                                throttler.Release();
+                            }
+                        }));
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("error: {0}", ex.Message);
                 }
+
             }
+
+            // won't get here until all urls have been put into tasks
+            await Task.WhenAll(allTasks);
         }
 
         private string DownloadHeader(NetClient client, string uri, string header)
@@ -140,7 +232,7 @@ namespace webget
             client.HeadOnly = true;
             client.DownloadData(uri);
             client.HeadOnly = false;
-            return client.ResponseHeaders.Get(header);           
+            return client.ResponseHeaders.Get(header);
         }
     }
 }
